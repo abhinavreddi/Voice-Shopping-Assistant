@@ -29,7 +29,7 @@ class ShoppingHome extends StatefulWidget {
 }
 
 class _ShoppingHomeState extends State<ShoppingHome> {
-  SpeechToText speech = SpeechToText();
+  final SpeechToText _speech = SpeechToText();
 
   bool isListening = false;
   String recognizedText = "";
@@ -42,27 +42,35 @@ class _ShoppingHomeState extends State<ShoppingHome> {
     loadItems();
   }
 
-
   Future<void> loadItems() async {
     final prefs = await SharedPreferences.getInstance();
     final saved = prefs.getStringList("shopping_list") ?? [];
 
-    items = saved.map((e) {
-      final parts = e.split("||");
-      return {"item": parts[0], "qty": int.parse(parts[1])};
-    }).toList();
+    final loaded = <Map<String, dynamic>>[];
+    for (final e in saved) {
+      try {
+        final p = e.split("||");
+        if (p.length >= 2) {
+          final item = p[0];
+          final qty = int.tryParse(p[1]) ?? 1;
+          loaded.add({"item": item, "qty": qty});
+        }
+      } catch (_) {
+      }
+    }
 
-    setState(() {});
+    setState(() {
+      items = loaded;
+    });
+    debugPrint("Loaded ${items.length} items from prefs");
   }
 
   Future<void> saveItems() async {
     final prefs = await SharedPreferences.getInstance();
-    prefs.setStringList(
-      "shopping_list",
-      items.map((e) => "${e['item']}||${e['qty']}").toList(),
-    );
+    final list = items.map((e) => "${e['item']}||${e['qty']}").toList();
+    await prefs.setStringList("shopping_list", list);
+    debugPrint("Saved ${list.length} items to prefs");
   }
-
 
   Future<void> toggleListening() async {
     var mic = await Permission.microphone.request();
@@ -72,133 +80,174 @@ class _ShoppingHomeState extends State<ShoppingHome> {
     }
 
     if (!isListening) {
-      bool available = await speech.initialize(
-        onStatus: (s) => print("STATUS: $s"),
-        onError: (e) => print("ERROR: $e"),
+      bool available = await _speech.initialize(
+        onStatus: (s) => debugPrint("STATUS: $s"),
+        onError: (e) => debugPrint("ERROR: $e"),
       );
 
       if (available) {
         setState(() {
           isListening = true;
           recognizedText = "";
-          statusMessage = "Listening…";
+          statusMessage = "Listening...";
         });
 
-        speech.listen(
+        _speech.listen(
           localeId: "en_US",
           onResult: (val) {
-            print("RAW: ${val.recognizedWords}");
-
-            setState(() {
-              recognizedText = val.recognizedWords;
-            });
+            if (val.recognizedWords.isNotEmpty) {
+              setState(() => recognizedText = val.recognizedWords);
+            }
 
             if (val.finalResult) {
-              print("FINAL: $recognizedText");
+              final finalText = val.recognizedWords;
               setState(() {
                 isListening = false;
-                statusMessage = "Processing… \"$recognizedText\"";
+                statusMessage = 'Processing… "$finalText"';
               });
-              _processCommand(recognizedText);
+
+              debugPrint("FINAL RECOGNIZED: $finalText");
+              processCommand(finalText);
             }
           },
         );
+      } else {
+        setState(() => statusMessage = "Speech recognition unavailable");
       }
     } else {
-      speech.stop();
+      await _speech.stop();
       setState(() => isListening = false);
     }
   }
 
-  
+  void processCommand(String text) {
+    final raw = text.toLowerCase().trim();
+    debugPrint("PROCESSING: '$raw'");
 
-  void _processCommand(String text) {
-    String command = text.toLowerCase();
-
-   
-    command = command
-        .replaceAll("\u200B", "")
-        .replaceAll("\u200C", "")
-        .replaceAll("\u200D", "")
-        .replaceAll("\uFEFF", "")
-        .trim();
-
-    print("PROCESSING: $command");
+    if (raw.isEmpty) {
+      setState(() => statusMessage = "No speech detected");
+      return;
+    }
 
     int qty = 1;
-    final match = RegExp(r'\d+').firstMatch(command);
-    if (match != null) qty = int.parse(match.group(0)!);
+    final numMatch = RegExp(r'\b(\d+)\b').firstMatch(raw);
+    if (numMatch != null) {
+      qty = int.tryParse(numMatch.group(1) ?? "1") ?? 1;
+    }
 
-    
-    String raw = command.replaceAll(RegExp(r'\d+'), "").trim();
+    String cleaned = raw.replaceAll(RegExp(r'[^\w\s]'), " "); 
+    cleaned = cleaned.replaceAll(RegExp(r'\b\d+\b'), "").replaceAll(RegExp(r'\s+'), " ").trim();
+
+    String extractItem(String source, List<String> keywords) {
+      var s = source;
+      for (final k in keywords) {
+        s = s.replaceAll(k, "");
+      }
+      s = s.replaceAll(RegExp(r'\s+'), " ").trim();
+
+      s = s.replaceAll(RegExp(r"""^[\'"]+|[\'"]+$"""), "");
+      return s;
+    }
+
+    if (raw.contains("add") || raw.contains("buy") || raw.contains("need") || raw.contains("put")) {
+      final item = extractItem(cleaned, ["add", "buy", "need", "put", "please", "can i", "i want"]);
+      if (item.isEmpty) {
+        setState(() => statusMessage = "Please say what to add (e.g. 'Add 2 apples').");
+        return;
+      }
+      addItem(item, qty);
+      return;
+    }
 
   
-    if (command.contains("add") ||
-        command.contains("buy") ||
-        command.contains("need")) {
-      String item = raw
-          .replaceAll("add", "")
-          .replaceAll("buy", "")
-          .replaceAll("need", "")
-          .trim();
-      _addItem(item, qty);
+    if (raw.contains("remove") || raw.contains("delete") || raw.contains("take away")) {
+      final item = extractItem(cleaned, ["remove", "delete", "take", "away"]);
+      if (item.isEmpty) {
+        setState(() => statusMessage = "Please say what to remove.");
+        return;
+      }
+      removeItem(item);
       return;
     }
 
-    
-    if (command.contains("remove") || command.contains("delete")) {
-      String item = raw
-          .replaceAll("remove", "")
-          .replaceAll("delete", "")
-          .trim();
-      _removeItem(item);
+  
+    if (raw.contains("find") || raw.contains("search") || raw.contains("is there")) {
+      final item = extractItem(cleaned, ["find", "search", "is", "there"]);
+      if (item.isEmpty) {
+        setState(() => statusMessage = "Please say what to find.");
+        return;
+      }
+      searchItem(item);
       return;
     }
 
-    
-    if (command.contains("find") || command.contains("search")) {
-      String item = raw.replaceAll("find", "").replaceAll("search", "").trim();
-      _searchItem(item);
-      return;
-    }
-
-    setState(() {
-      statusMessage = "Sorry, I did not understand.";
-    });
+    setState(() => statusMessage = "Sorry, I did not understand.");
   }
 
- 
 
-  void _addItem(String item, int qty) {
+  void addItem(String itemRaw, int qty) async {
+    final item = itemRaw.trim().toLowerCase(); 
     if (item.isEmpty) return;
 
-    items.add({"item": item, "qty": qty});
-    saveItems();
+    final existingIndex = items.indexWhere((e) => (e['item'] as String).toLowerCase() == item);
+    if (existingIndex >= 0) {
+      setState(() {
+        items[existingIndex]['qty'] = (items[existingIndex]['qty'] as int) + qty;
+        statusMessage = "Updated ${items[existingIndex]['qty']} × $item";
+      });
+      await saveItems();
+      return;
+    }
 
     setState(() {
+      items.add({"item": item, "qty": qty});
       statusMessage = "Added $qty × $item";
     });
+
+    await saveItems();
+    debugPrint("After add: ${items.length} items");
   }
 
-  void _removeItem(String item) {
-    items.removeWhere((e) => e["item"] == item);
-    saveItems();
+  void removeItem(String itemRaw) async {
+    final item = itemRaw.trim().toLowerCase();
+    if (item.isEmpty) return;
 
+    final before = items.length;
     setState(() {
+      items.removeWhere((e) => (e['item'] as String).toLowerCase() == item);
       statusMessage = "Removed $item";
     });
+
+    if (items.length != before) {
+      await saveItems();
+      debugPrint("After remove: ${items.length} items");
+    } else {
+      setState(() => statusMessage = "$item not found in list");
+    }
   }
 
-  void _searchItem(String item) {
-    bool exists = items.any((e) => e["item"] == item);
+  void searchItem(String itemRaw) {
+    final item = itemRaw.trim().toLowerCase();
+    if (item.isEmpty) {
+      setState(() => statusMessage = "Please specify an item to search");
+      return;
+    }
+
+    final found = items.firstWhere(
+      (e) => (e['item'] as String).toLowerCase() == item,
+      orElse: () => {},
+    );
 
     setState(() {
-      statusMessage = exists ? "$item is in your list" : "$item not found";
+      if (found.isEmpty) {
+        statusMessage = "$item not found";
+      } else {
+        statusMessage = "$item is in your list (${found['qty']})";
+      }
     });
   }
 
   
-
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -208,13 +257,11 @@ class _ShoppingHomeState extends State<ShoppingHome> {
         onPressed: toggleListening,
         child: Icon(isListening ? Icons.mic : Icons.mic_none),
       ),
-
       body: Padding(
         padding: const EdgeInsets.all(16.0),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            // status
             Center(
               child: Card(
                 elevation: 4,
@@ -227,16 +274,12 @@ class _ShoppingHomeState extends State<ShoppingHome> {
                 ),
               ),
             ),
-
             const SizedBox(height: 20),
-
             const Text(
               "Your List:",
               style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
             ),
-
             const SizedBox(height: 10),
-
             Expanded(
               child: items.isEmpty
                   ? const Center(child: Text("Your shopping list is empty"))
@@ -244,20 +287,29 @@ class _ShoppingHomeState extends State<ShoppingHome> {
                       itemCount: items.length,
                       itemBuilder: (context, index) {
                         final x = items[index];
-                        return ListTile(
-                          leading: CircleAvatar(
-                            child: Text(x["qty"].toString()),
+                        return Dismissible(
+                          key: Key("${x['item']}_${x['qty']}_$index"),
+                          background: Container(color: Colors.redAccent),
+                          onDismissed: (_) async {
+                            final removedItem = x['item'] as String;
+                            removeItem(removedItem);
+                          },
+                          child: ListTile(
+                            leading: CircleAvatar(
+                              child: Text((x["qty"] as int).toString()),
+                            ),
+                            title: Text(x["item"] as String),
                           ),
-                          title: Text(x["item"]),
                         );
                       },
                     ),
             ),
-
             const SizedBox(height: 10),
             const Text(
-              'Examples: "Add 2 bottles of water", "Remove milk", "Find apples".',
+              'Examples: "Add 2 apples", "Remove milk", "Find sugar".',
             ),
+            const SizedBox(height: 20),
+          
           ],
         ),
       ),
